@@ -1,0 +1,182 @@
+#!/usr/bin/env python
+# -*- encoding: utf-8 -*-
+#
+# PowerDNS Auth Zone Differ (depends on PowerDNS API)
+# Copyright 2015 Deduktiva GmbH <http://deduktiva.com/>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+from __future__ import print_function, unicode_literals
+
+import requests  # python-requests
+import difflib  # stdlib
+import argparse  # stdlib
+import sys
+
+from requests.exceptions import RequestException
+
+
+def fetch(api_key, server, url):
+    req = requests.get(server + url, headers={u'X-API-Key': api_key, u'Accept': u'application/json'})
+    req.raise_for_status()
+    return req.json()
+
+
+def fetch_server_name(api_key, server):
+    return next((x[u'value'] for x in fetch(api_key, server, u'/servers/localhost/config')
+                 if x[u'name'] == u'server-id'), None)
+
+
+def fetch_basedata(api_key, server):
+    name = fetch_server_name(api_key, server)
+    zones = fetch(api_key, server, u'/servers/localhost/zones')
+    zonenames = {zone[u'name'] for zone in zones}
+    return name, zones, zonenames
+
+
+def comment_format(c):
+    return u'; [%s @ %s] %s' % (c[u'account'], c[u'modified_at'], c[u'content'])
+
+
+def record_format(r):
+    return u'%s%s\t%s\t%s\t%s' % ((u'; ' if r[u'disabled'] else u''),
+                                  r[u'name'],
+                                  r[u'type'],
+                                  r[u'ttl'],
+                                  r[u'content'])
+
+
+def type_weight(typename):
+    return {u'SOA': 0, u'NS': 1, u'DS': 2}.get(typename, 1000 + sum(ord(x) for x in typename))
+
+
+def comparator(x, y):
+    x_revname = x[u'name'][::-1]
+    y_revname = y[u'name'][::-1]
+    if x_revname != y_revname:
+        return cmp(x_revname, y_revname)
+    if x[u'type'] != y[u'type']:
+        return cmp(type_weight(x[u'type']), type_weight(y[u'type']))
+    x_is_comment = u'modified_at' in x
+    y_is_comment = u'modified_at' in y
+    if x_is_comment != y_is_comment:
+        return 1 if x_is_comment else -1
+    if x_is_comment:  # both comments
+        if x[u'modified_at'] != y[u'modified_at']:
+            return cmp(x[u'modified_at'], y[u'modified_at'])
+        if x[u'account'] != y[u'account']:
+            return cmp(x[u'account'], y[u'account'])
+        if x[u'content'] != y[u'content']:
+            return cmp(x[u'content'], y[u'content'])
+    else:  # both records
+        if x[u'content'] != y[u'content']:
+            return cmp(x[u'content'], y[u'content'])
+        if x[u'ttl'] != y[u'ttl']:
+            return cmp(x[u'ttl'], y[u'ttl'])
+    return 0
+
+
+def zone_format(zone):
+    # Note: does NOT produce an industry standard format representation.
+    keys = sorted(set(zone.keys()) - {u'comments', u'records', u'id', u'url', u'name'})
+    combined = sorted([(c, comment_format(c)) for c in zone[u'comments']] +
+                      [(r, record_format(r)) for r in zone[u'records']],
+                      cmp=comparator, key=lambda thing: thing[0])
+    return ([u';;; %s' % zone[u'name']] +
+            [u'; %s = %s' % (k, zone[k]) for k in keys] +
+            [thing[1] for thing in combined])
+
+
+def run(api_key, server1, server2):
+    try:
+        name_server1, zones_server1, zonenames_server1 = fetch_basedata(api_key, server1)
+    except RequestException as except_inst:
+        print(u"E: Failed fetching config or zones from %s: %s" % (server1, except_inst))
+        return 3
+
+    try:
+        name_server2, zones_server2, zonenames_server2 = fetch_basedata(api_key, server2)
+    except RequestException as except_inst:
+        print(u"E: Failed fetching config or zones from %s: %s" % (server2, except_inst))
+        return 4
+
+    print(u"I: server1: URL: %s, Name: %s" % (server1, name_server1))
+    print(u"I: server2: URL: %s, Name: %s" % (server2, name_server2))
+
+    missing_server1 = zonenames_server2 - zonenames_server1
+    missing_server2 = zonenames_server1 - zonenames_server2
+    if missing_server1:
+        print(u"W: Zones missing from %s:" % name_server1, u' '.join(missing_server1))
+    if missing_server2:
+        print(u"W: Zones missing from %s:" % name_server2, u' '.join(missing_server2))
+
+    errors, diffs, identical = 0, 0, 0
+    common_zones = [zone for zone in zones_server1 if zone[u'name'] in zonenames_server2]
+    for zone in common_zones:
+        zone_url = zone[u'url']
+        try:
+            zone1 = fetch(api_key, server1, zone_url)
+        except RequestException as except_inst:
+            print(u"E: Error while fetching %s from %s: %s" % (zone_url, server1, except_inst))
+            errors += 1
+            continue
+
+        try:
+            zone2 = fetch(api_key, server2, zone_url)
+        except RequestException as except_inst:
+            print(u"E: Error while fetching %s from %s: %s" % (zone_url, server2, except_inst))
+            errors += 1
+            continue
+
+        zonetxt1 = zone_format(zone1)
+        zonetxt2 = zone_format(zone2)
+
+        if zonetxt1 == zonetxt2:
+            identical += 1
+        else:
+            diffs += 1
+            print(u'diff zone %s on server %s to server %s' % (zone1[u'name'], name_server1, name_server2))
+            for line in difflib.unified_diff(zonetxt1, zonetxt2,
+                                             u'%s/%s' % (name_server1, zone1[u'name']),
+                                             u'%s/%s' % (name_server2, zone2[u'name']), lineterm=u""):
+                print(line)
+
+
+    if diffs:
+        print(u"---")
+    print(u"I: %s zones, %s different, %s identical, plus %s errors" % (identical + diffs, diffs, identical, errors))
+    if diffs:
+        return 1
+    if errors:
+        return 2
+    return 0
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Diff PowerDNS data')
+    parser.add_argument(u'apikey', metavar=u'KEY', help=u'API Key', default=u'changeme')
+    parser.add_argument(u'server1', metavar=u'URL1', help=u'API URL for server1')
+    parser.add_argument(u'server2', metavar=u'URL2', help=u'API URL for server2')
+    return parser.parse_args()
+
+
+if __name__ == u'__main__':
+    args = parse_args()
+    sys.exit(run(args.apikey, args.server1, args.server2))
+
